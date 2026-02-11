@@ -21,4 +21,3 @@ jobs:
       - run: npm ci
       - run: npm run capture -- --help
       - run: npm run report -- --help
-      - run: npm run identify:alternatives
