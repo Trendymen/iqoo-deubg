@@ -1,0 +1,7 @@
+{
+  "hostPing": {
+    "enabled": false,
+    "hostIp": "192.168.5.25",
+    "intervalSec": 0.2
+  }
+}

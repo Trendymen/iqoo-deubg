@@ -1,0 +1,27 @@
+{
+  "name": "adb-periodic-net-analyzer",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "capture": "node capture.js",
+    "capture:ping": "node capture.js --host-ping",
+    "report": "node parse_report.js --latest"
+  },
+  "dependencies": {
+    "commander": "^14.0.3",
+    "csv-stringify": "^6.6.0",
+    "dayjs": "^1.11.19",
+    "execa": "^9.6.1",
+    "fast-glob": "^3.3.3",
+    "fs-extra": "^11.3.3",
+    "markdown-table": "^3.0.4",
+    "open": "^11.0.0",
+    "p-queue": "^9.1.0",
+    "simple-statistics": "^7.8.8",
+    "zod": "^4.3.6"
+  }
+}
