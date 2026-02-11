@@ -5,7 +5,7 @@ function createCaptureProgram() {
   return new Command()
     .name('capture')
     .description('采集 Android Wi-Fi/网络/Doze 日志')
-    .option('--minutes <number>', '采集时长（分钟）', '30')
+    .option('--minutes <number>', '采集时长（分钟）', '15')
     .option('--out <dir>', '输出根目录', './logs')
     .option('--config <path>', '采集配置文件（JSON）', './capture.config.json')
     .option('--host-ping', '启用主机延迟连续采样（adb shell ping）', false)

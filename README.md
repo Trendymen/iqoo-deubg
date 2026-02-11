@@ -54,7 +54,7 @@ npm run report
 
 ### 采集
 
-- 默认采集（30 分钟）：`npm run capture`
+- 默认采集（15 分钟）：`npm run capture`
 - 采集并启用 host ping：`npm run capture:ping`
 - 自定义参数：
 
@@ -88,12 +88,12 @@ node parse_report.js --dir ./logs/20260211_163149
 
 可选高级参数（按需）：
 
-- `--stream-window-mode auto|strict|all`
-- `--noise-policy balanced|aggressive|conservative`
-- `--session-pre-buffer-sec`
-- `--session-post-buffer-sec`
-- `--clock-skew-tolerance-sec`
-- `--no-valid-session-policy empty-main|degraded`
+- `--stream-window-mode auto|strict|all`：串流窗口识别模式。`auto` 自动平衡召回/精度（默认），`strict` 更严格只保留高置信窗口，`all` 尽量不过滤窗口。
+- `--noise-policy balanced|aggressive|conservative`：App 日志降噪策略。`balanced` 平衡模式（默认），`aggressive` 更激进去噪，`conservative` 更保守保留更多原始信号。
+- `--session-pre-buffer-sec`：会话窗口前置缓冲秒数（默认 `5`），用于把会话开始前的上下文事件纳入分析。
+- `--session-post-buffer-sec`：会话窗口后置缓冲秒数（默认 `10`），用于把会话结束后的尾部影响纳入分析。
+- `--clock-skew-tolerance-sec`：时间戳对齐容差秒数（默认 `2`），用于缓解不同日志源的时钟偏移。
+- `--no-valid-session-policy empty-main|degraded`：未识别到有效会话时的处理策略。`empty-main` 主分析置空（默认），`degraded` 退化到较宽松分析并尽量给出线索。
 
 ## 输出目录与关键文件
 
