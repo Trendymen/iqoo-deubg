@@ -895,3 +895,243 @@ export function buildPingAppAnalysis(pingFocus, appFocus, eventsByType, {
     jitterAlignmentRows
   };
 }
+
+function summarizePingFocus(pingFocus) {
+  const successSamples = (pingFocus && pingFocus.samples ? pingFocus.samples : [])
+    .filter((x) => x.success && Number.isFinite(x.latencyMs))
+    .sort((a, b) => a.ts.getTime() - b.ts.getTime());
+  const latencySummary = summarizeValues(successSamples.map((x) => x.latencyMs));
+  const burstCount = (pingFocus && pingFocus.highLatencyBursts ? pingFocus.highLatencyBursts.length : 0);
+  const jitterCount = (pingFocus && pingFocus.jitterEvents ? pingFocus.jitterEvents.length : 0);
+  return {
+    sampleCount: pingFocus && Number.isFinite(pingFocus.sampleCount) ? pingFocus.sampleCount : 0,
+    successCount: pingFocus && Number.isFinite(pingFocus.successCount) ? pingFocus.successCount : 0,
+    failureCount: pingFocus && Number.isFinite(pingFocus.failureCount) ? pingFocus.failureCount : 0,
+    highLatencyBurstCount: burstCount,
+    jitterEventCount: jitterCount,
+    p50Ms: latencySummary.p50,
+    p95Ms: latencySummary.p95,
+    maxMs: latencySummary.max,
+    avgMs: latencySummary.avg
+  };
+}
+
+function extractSampleEpochMs(pingFocus) {
+  return (pingFocus && pingFocus.samples ? pingFocus.samples : [])
+    .map((x) => (x && x.ts instanceof Date ? x.ts.getTime() : NaN))
+    .filter((x) => Number.isFinite(x))
+    .sort((a, b) => a - b);
+}
+
+function computeSampleAlignmentStats(devicePingFocus, hostSidePingFocus, windowMs) {
+  const deviceTimes = extractSampleEpochMs(devicePingFocus);
+  const hostTimes = extractSampleEpochMs(hostSidePingFocus);
+  if (!deviceTimes.length || !hostTimes.length) {
+    return {
+      windowMs,
+      deviceSampleCount: deviceTimes.length,
+      hostSideSampleCount: hostTimes.length,
+      pairedCount: 0,
+      deviceUnpairedCount: deviceTimes.length,
+      hostSideUnpairedCount: hostTimes.length,
+      deviceCoverage: 0,
+      hostSideCoverage: 0,
+      avgDeltaMs: null,
+      p50AbsDeltaMs: null,
+      p95AbsDeltaMs: null,
+      maxAbsDeltaMs: null
+    };
+  }
+
+  let i = 0;
+  let j = 0;
+  let pairedCount = 0;
+  const deltas = [];
+  const absDeltas = [];
+  while (i < deviceTimes.length && j < hostTimes.length) {
+    const deltaMs = hostTimes[j] - deviceTimes[i];
+    const absDeltaMs = Math.abs(deltaMs);
+    if (absDeltaMs <= windowMs) {
+      pairedCount += 1;
+      deltas.push(deltaMs);
+      absDeltas.push(absDeltaMs);
+      i += 1;
+      j += 1;
+      continue;
+    }
+    if (deviceTimes[i] < hostTimes[j]) i += 1;
+    else j += 1;
+  }
+
+  const absSummary = summarizeValues(absDeltas);
+  const avgDeltaMs = deltas.length
+    ? (deltas.reduce((acc, v) => acc + v, 0) / deltas.length)
+    : null;
+  return {
+    windowMs,
+    deviceSampleCount: deviceTimes.length,
+    hostSideSampleCount: hostTimes.length,
+    pairedCount,
+    deviceUnpairedCount: Math.max(0, deviceTimes.length - pairedCount),
+    hostSideUnpairedCount: Math.max(0, hostTimes.length - pairedCount),
+    deviceCoverage: deviceTimes.length ? (pairedCount / deviceTimes.length) : 0,
+    hostSideCoverage: hostTimes.length ? (pairedCount / hostTimes.length) : 0,
+    avgDeltaMs,
+    p50AbsDeltaMs: absSummary.p50,
+    p95AbsDeltaMs: absSummary.p95,
+    maxAbsDeltaMs: absSummary.max
+  };
+}
+
+function computeBurstOverlapStats(deviceBursts, hostSideBursts, windowMs) {
+  const devicePoints = (deviceBursts || []).map((x) => x.startTs.getTime()).sort((a, b) => a - b);
+  const hostPoints = (hostSideBursts || []).map((x) => x.startTs.getTime()).sort((a, b) => a - b);
+  if (!devicePoints.length || !hostPoints.length) {
+    return {
+      overlapCount: 0,
+      deviceHitRatio: 0,
+      hostHitRatio: 0,
+      overlapRatio: 0
+    };
+  }
+  let overlapCount = 0;
+  let deviceHit = 0;
+  let hostHit = 0;
+
+  for (const point of devicePoints) {
+    const c = countInRange(hostPoints, point - windowMs, point + windowMs);
+    if (c > 0) deviceHit += 1;
+    overlapCount += c > 0 ? 1 : 0;
+  }
+  for (const point of hostPoints) {
+    const c = countInRange(devicePoints, point - windowMs, point + windowMs);
+    if (c > 0) hostHit += 1;
+  }
+  const deviceHitRatio = devicePoints.length ? (deviceHit / devicePoints.length) : 0;
+  const hostHitRatio = hostPoints.length ? (hostHit / hostPoints.length) : 0;
+  return {
+    overlapCount,
+    deviceHitRatio,
+    hostHitRatio,
+    overlapRatio: (deviceHitRatio + hostHitRatio) / 2
+  };
+}
+
+function classifyBidirectionalDirection({
+  deviceSummary,
+  hostSummary,
+  overlapRatio
+}) {
+  const deviceScore = (deviceSummary.p95Ms || 0) + (deviceSummary.maxMs || 0) * 0.4 + (deviceSummary.highLatencyBurstCount || 0) * 6;
+  const hostScore = (hostSummary.p95Ms || 0) + (hostSummary.maxMs || 0) * 0.4 + (hostSummary.highLatencyBurstCount || 0) * 6;
+  const strongerThreshold = 1.35;
+
+  if ((deviceSummary.sampleCount || 0) === 0 && (hostSummary.sampleCount || 0) === 0) {
+    return {
+      direction: 'no_data',
+      confidence: 'low',
+      detail: '双端均无可用 ping 样本'
+    };
+  }
+
+  if ((deviceSummary.highLatencyBurstCount || 0) > 0
+    && (hostSummary.highLatencyBurstCount || 0) > 0
+    && overlapRatio >= 0.4) {
+    return {
+      direction: 'bidirectional',
+      confidence: overlapRatio >= 0.7 ? 'high' : 'medium',
+      detail: `双端高延迟段同窗重叠率 ${(overlapRatio * 100).toFixed(1)}%`
+    };
+  }
+
+  if (deviceScore > 0 && deviceScore >= hostScore * strongerThreshold) {
+    return {
+      direction: 'device_uplink_dominant',
+      confidence: deviceScore >= hostScore * 1.7 ? 'high' : 'medium',
+      detail: `设备侧抖动强度显著高于主机侧（score ${deviceScore.toFixed(2)} vs ${hostScore.toFixed(2)}）`
+    };
+  }
+
+  if (hostScore > 0 && hostScore >= deviceScore * strongerThreshold) {
+    return {
+      direction: 'host_downlink_dominant',
+      confidence: hostScore >= deviceScore * 1.7 ? 'high' : 'medium',
+      detail: `主机侧抖动强度显著高于设备侧（score ${hostScore.toFixed(2)} vs ${deviceScore.toFixed(2)}）`
+    };
+  }
+
+  if ((deviceSummary.highLatencyBurstCount || 0) > 0 || (hostSummary.highLatencyBurstCount || 0) > 0) {
+    return {
+      direction: 'mixed_or_path_specific',
+      confidence: 'low',
+      detail: '双端存在抖动，但同窗重叠不足以判定为双向同时抖动'
+    };
+  }
+
+  return {
+    direction: 'inconclusive',
+    confidence: 'low',
+    detail: '未出现显著高延迟段，无法形成方向性判定'
+  };
+}
+
+export function buildBidirectionalPingAnalysis(devicePingFocus, hostSidePingFocus, {
+  windowSec = 1,
+  sampleAlignWindowMs = 250
+} = {}) {
+  const deviceBursts = (devicePingFocus && devicePingFocus.highLatencyBursts) || [];
+  const hostBursts = (hostSidePingFocus && hostSidePingFocus.highLatencyBursts) || [];
+  const overlapStats = computeBurstOverlapStats(deviceBursts, hostBursts, Math.round(windowSec * 1000));
+  const deviceSummary = summarizePingFocus(devicePingFocus || {});
+  const hostSummary = summarizePingFocus(hostSidePingFocus || {});
+  const sampleAlignment = computeSampleAlignmentStats(devicePingFocus || {}, hostSidePingFocus || {}, Math.max(50, Math.round(sampleAlignWindowMs)));
+  const classification = classifyBidirectionalDirection({
+    deviceSummary,
+    hostSummary,
+    overlapRatio: overlapStats.overlapRatio
+  });
+
+  const findings = [];
+  if ((deviceSummary.highLatencyBurstCount || 0) > 0 && (hostSummary.highLatencyBurstCount || 0) === 0) {
+    findings.push({
+      type: 'device_only_high_latency',
+      level: 'medium',
+      detail: '设备侧出现高延迟段，主机侧未出现对应高延迟段'
+    });
+  }
+  if ((hostSummary.highLatencyBurstCount || 0) > 0 && (deviceSummary.highLatencyBurstCount || 0) === 0) {
+    findings.push({
+      type: 'host_only_high_latency',
+      level: 'medium',
+      detail: '主机侧出现高延迟段，设备侧未出现对应高延迟段'
+    });
+  }
+  if (overlapStats.overlapRatio >= 0.4) {
+    findings.push({
+      type: 'bidirectional_overlap',
+      level: overlapStats.overlapRatio >= 0.7 ? 'high' : 'medium',
+      detail: `双端高延迟段重叠率 ${(overlapStats.overlapRatio * 100).toFixed(1)}%`
+    });
+  }
+  if (
+    sampleAlignment.pairedCount > 0
+    && (sampleAlignment.deviceCoverage < 0.75 || sampleAlignment.hostSideCoverage < 0.75)
+  ) {
+    findings.push({
+      type: 'sample_alignment_low_coverage',
+      level: 'low',
+      detail: `双端样本配对覆盖率偏低（device ${(sampleAlignment.deviceCoverage * 100).toFixed(1)}%, host ${(sampleAlignment.hostSideCoverage * 100).toFixed(1)}%）`
+    });
+  }
+
+  return {
+    windowSec,
+    sampleAlignWindowMs: sampleAlignment.windowMs,
+    device: deviceSummary,
+    hostSide: hostSummary,
+    sampleAlignment,
+    overlap: overlapStats,
+    classification,
+    findings
+  };
+}

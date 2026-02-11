@@ -10,7 +10,16 @@ import { parsePingHostLog } from './ping-parser.js';
 import { addDeviceIdleTransitions, addPowerTransitions } from './transition-parser.js';
 import { addWifiTransitions, addAlarmTransitions, addJobsTransitions, addConnectivityTransitions } from './dumpsys-event-parser.js';
 import { buildContexts } from './context-extractor.js';
-import { buildTimeline, buildIntervals, buildEventCount, pickTopPeriodicEvents, buildAlignment, buildAppFocusAnalysis, buildPingAppAnalysis } from './analyzer.js';
+import {
+  buildTimeline,
+  buildIntervals,
+  buildEventCount,
+  pickTopPeriodicEvents,
+  buildAlignment,
+  buildAppFocusAnalysis,
+  buildPingAppAnalysis,
+  buildBidirectionalPingAnalysis
+} from './analyzer.js';
 import {
   detectStreamingPhases,
   buildStreamWindowRows,
@@ -241,6 +250,7 @@ export async function runReportFromCli(argv = process.argv.slice(2)) {
   const captureMeta = readJsonIfExists(files.captureMeta);
   const captureStartTs = parseIsoDateSafe(captureMeta && captureMeta.startedAtIso);
   const pingIntervalSec = Number((captureMeta && captureMeta.hostPing && captureMeta.hostPing.intervalSec) || 0.2);
+  const hostSidePingIntervalSec = Number((captureMeta && captureMeta.hostSidePing && captureMeta.hostSidePing.intervalSec) || 0.2);
   const streamDetection = await detectStreamingPhases(files.logcat, new Date().getFullYear(), {
     mode: args.streamWindowMode
   });
@@ -271,6 +281,11 @@ export async function runReportFromCli(argv = process.argv.slice(2)) {
   const pingFocus = await parsePingHostLog(files.pingHost, {
     captureStartTs,
     intervalSec: pingIntervalSec,
+    streamDetection
+  });
+  const hostSidePingFocus = await parsePingHostLog(files.pingHostSide, {
+    captureStartTs,
+    intervalSec: hostSidePingIntervalSec,
     streamDetection
   });
 
@@ -394,6 +409,28 @@ export async function runReportFromCli(argv = process.argv.slice(2)) {
     line: (x.line || '').slice(0, 320)
   }));
   fs.writeFileSync(files.pingLatencySessionCsv, toCsv(pingSessionRows, ['ts', 'seq', 'status', 'latency_ms', 'phase', 'in_session', 'ts_source', 'line']));
+  const hostSidePingRows = hostSidePingFocus.samples.map((x) => ({
+    ts: formatTs(x.ts),
+    seq: x.seq == null ? '' : x.seq,
+    status: x.status,
+    latency_ms: x.latencyMs == null ? '' : x.latencyMs,
+    phase: x.phase || '',
+    in_session: x.inSession ? 'true' : 'false',
+    ts_source: x.tsSource || '',
+    line: (x.line || '').slice(0, 320)
+  }));
+  fs.writeFileSync(files.pingLatencyHostSideCsv, toCsv(hostSidePingRows, ['ts', 'seq', 'status', 'latency_ms', 'phase', 'in_session', 'ts_source', 'line']));
+  const hostSidePingSessionRows = (hostSidePingFocus.sessionSamples || []).map((x) => ({
+    ts: formatTs(x.ts),
+    seq: x.seq == null ? '' : x.seq,
+    status: x.status,
+    latency_ms: x.latencyMs == null ? '' : x.latencyMs,
+    phase: x.phase || '',
+    in_session: x.inSession ? 'true' : 'false',
+    ts_source: x.tsSource || '',
+    line: (x.line || '').slice(0, 320)
+  }));
+  fs.writeFileSync(files.pingLatencyHostSideSessionCsv, toCsv(hostSidePingSessionRows, ['ts', 'seq', 'status', 'latency_ms', 'phase', 'in_session', 'ts_source', 'line']));
 
   const noValidSessionReason = streamDetection.detected
     ? (streamDetection.effectiveWindows.length ? null : 'no_effective_windows')
@@ -403,6 +440,7 @@ export async function runReportFromCli(argv = process.argv.slice(2)) {
 
   const appFocusSession = filterAppFocusBySession(appFocus);
   const pingFocusSession = buildSessionPingFocus(pingFocus);
+  const hostSidePingFocusSession = buildSessionPingFocus(hostSidePingFocus);
   const allPhases = ['stream', 'preconnect', 'post', 'unknown'];
   const legacyAnalysisPhases = args.streamWindowMode === 'all'
     ? allPhases
@@ -426,6 +464,16 @@ export async function runReportFromCli(argv = process.argv.slice(2)) {
     highLatencyBursts: [],
     jitterEvents: []
   });
+  const hostSidePingFocusMain = mainAnalysisAvailable ? hostSidePingFocusSession : (useDegradedFallback ? hostSidePingFocus : {
+    ...hostSidePingFocus,
+    sampleCount: 0,
+    successCount: 0,
+    failureCount: 0,
+    samples: [],
+    highLatencyEvents: [],
+    highLatencyBursts: [],
+    jitterEvents: []
+  });
   const analysisPhasesMain = mainAnalysisAvailable ? allPhases : (useDegradedFallback ? legacyAnalysisPhases : []);
   const degradedAnalysis = useDegradedFallback;
 
@@ -435,6 +483,7 @@ export async function runReportFromCli(argv = process.argv.slice(2)) {
       allowedPhases: analysisPhasesMain
     })
     : buildEmptyAppAnalysis();
+  const sampleAlignWindowMs = Math.max(120, Math.round(Math.max(pingIntervalSec, hostSidePingIntervalSec) * 1000 * 1.5));
   const pingAnalysis = (mainAnalysisAvailable || useDegradedFallback)
     ? buildPingAppAnalysis(pingFocusMain, appFocusMain, eventsByTypeMain, {
       windowSec: 1,
@@ -442,6 +491,29 @@ export async function runReportFromCli(argv = process.argv.slice(2)) {
       degraded: degradedAnalysis
     })
     : buildEmptyPingAnalysis();
+  const bidirectionalPingAnalysis = (mainAnalysisAvailable || useDegradedFallback)
+    ? buildBidirectionalPingAnalysis(pingFocusMain, hostSidePingFocusMain, {
+      windowSec: 1,
+      sampleAlignWindowMs
+    })
+    : buildBidirectionalPingAnalysis({
+      sampleCount: 0,
+      successCount: 0,
+      failureCount: 0,
+      samples: [],
+      highLatencyBursts: [],
+      jitterEvents: []
+    }, {
+      sampleCount: 0,
+      successCount: 0,
+      failureCount: 0,
+      samples: [],
+      highLatencyBursts: [],
+      jitterEvents: []
+    }, {
+      windowSec: 1,
+      sampleAlignWindowMs
+    });
 
   const top3 = (mainAnalysisAvailable || useDegradedFallback)
     ? pickTopPeriodicEvents(eventsByTypeMain, mainAnalysisAvailable ? intervalsSession.periodicityByType : intervalsAll.periodicityByType)
@@ -487,7 +559,10 @@ export async function runReportFromCli(argv = process.argv.slice(2)) {
     degradedAnalysis,
     pingFocus: pingFocusMain,
     pingFocusAll: pingFocus,
+    hostSidePingFocus: hostSidePingFocusMain,
+    hostSidePingFocusAll: hostSidePingFocus,
     pingAnalysis,
+    bidirectionalPingAnalysis,
     mainAnalysisAvailable,
     noValidSessionReason,
     noValidSessionPolicy: args.noValidSessionPolicy,
@@ -507,6 +582,9 @@ export async function runReportFromCli(argv = process.argv.slice(2)) {
       pingHostLog: files.pingHost,
       pingLatencyCsv: files.pingLatencyCsv,
       pingLatencySessionCsv: files.pingLatencySessionCsv,
+      pingHostSideLog: files.pingHostSide,
+      pingLatencyHostSideCsv: files.pingLatencyHostSideCsv,
+      pingLatencyHostSideSessionCsv: files.pingLatencyHostSideSessionCsv,
       timelineCsv: files.timelineCsv,
       timelineSessionCsv: files.timelineSessionCsv,
       intervalsCsv: files.intervalsCsv,
@@ -522,7 +600,7 @@ export async function runReportFromCli(argv = process.argv.slice(2)) {
   fs.writeFileSync(files.reportMd, reportMarkdown);
 
   const analysisMeta = {
-    version: 6,
+    version: 8,
     logDir,
     generatedAtIso: new Date().toISOString(),
     counts: {
@@ -545,7 +623,15 @@ export async function runReportFromCli(argv = process.argv.slice(2)) {
       pingSampleCount: pingFocusMain.sampleCount,
       pingSuccessCount: pingFocusMain.successCount,
       pingFailureCount: pingFocusMain.failureCount,
-      pingSessionSampleCount: pingFocusSession.sampleCount
+      pingSessionSampleCount: pingFocusSession.sampleCount,
+      hostSidePingSampleCount: hostSidePingFocusMain.sampleCount,
+      hostSidePingSuccessCount: hostSidePingFocusMain.successCount,
+      hostSidePingFailureCount: hostSidePingFocusMain.failureCount,
+      hostSidePingSessionSampleCount: hostSidePingFocusSession.sampleCount,
+      bidirectionalPairedSampleCount: (bidirectionalPingAnalysis.sampleAlignment && bidirectionalPingAnalysis.sampleAlignment.pairedCount) || 0,
+      bidirectionalSampleAlignWindowMs: bidirectionalPingAnalysis.sampleAlignWindowMs || 0,
+      bidirectionalDevicePairCoverage: (bidirectionalPingAnalysis.sampleAlignment && bidirectionalPingAnalysis.sampleAlignment.deviceCoverage) || 0,
+      bidirectionalHostPairCoverage: (bidirectionalPingAnalysis.sampleAlignment && bidirectionalPingAnalysis.sampleAlignment.hostSideCoverage) || 0
     },
     session: {
       policy: args.noValidSessionPolicy,
@@ -631,7 +717,17 @@ export async function runReportFromCli(argv = process.argv.slice(2)) {
       summary: pingFocus.summary,
       highLatencyThresholdMs: pingFocus.highLatencyThresholdMs
     },
+    hostSidePingFocus: {
+      exists: hostSidePingFocus.exists,
+      firstTs: hostSidePingFocus.firstTs ? hostSidePingFocus.firstTs.toISOString() : null,
+      lastTs: hostSidePingFocus.lastTs ? hostSidePingFocus.lastTs.toISOString() : null,
+      tsSourceCounts: hostSidePingFocus.tsSourceCounts,
+      phaseCounts: hostSidePingFocus.phaseCounts,
+      summary: hostSidePingFocus.summary,
+      highLatencyThresholdMs: hostSidePingFocus.highLatencyThresholdMs
+    },
     pingAnalysis,
+    bidirectionalPingAnalysis,
     causeRanking: pingAnalysis.causeRanking || [],
     outputFiles: {
       appFocusLog: files.appFocusLog,
@@ -642,6 +738,9 @@ export async function runReportFromCli(argv = process.argv.slice(2)) {
       pingHostLog: files.pingHost,
       pingLatencyCsv: files.pingLatencyCsv,
       pingLatencySessionCsv: files.pingLatencySessionCsv,
+      pingHostSideLog: files.pingHostSide,
+      pingLatencyHostSideCsv: files.pingLatencyHostSideCsv,
+      pingLatencyHostSideSessionCsv: files.pingLatencyHostSideSessionCsv,
       timelineCsv: files.timelineCsv,
       timelineSessionCsv: files.timelineSessionCsv,
       intervalsCsv: files.intervalsCsv,
@@ -663,6 +762,8 @@ export async function runReportFromCli(argv = process.argv.slice(2)) {
   console.log(`  - ${files.streamWindowsEffectiveCsv}`);
   console.log(`  - ${files.pingLatencyCsv}`);
   console.log(`  - ${files.pingLatencySessionCsv}`);
+  console.log(`  - ${files.pingLatencyHostSideCsv}`);
+  console.log(`  - ${files.pingLatencyHostSideSessionCsv}`);
   console.log(`  - ${files.reportMd}`);
   console.log(`  - ${files.analysisMeta}`);
 }

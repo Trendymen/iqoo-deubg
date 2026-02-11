@@ -12,6 +12,7 @@ export function buildCapturePaths(outRoot, startedAt) {
     logcatAll: path.join(outDir, 'logcat_all.log'),
     logcatErr: path.join(outDir, 'logcat_stderr.log'),
     pingHost: path.join(outDir, 'ping_host.log'),
+    pingHostSide: path.join(outDir, 'ping_host_side.log'),
     meta: path.join(outDir, 'capture_meta.json')
   };
   for (const task of TASKS) {
@@ -20,7 +21,7 @@ export function buildCapturePaths(outRoot, startedAt) {
   return filePaths;
 }
 
-export function createCaptureStreams(filePaths, { enablePingHost = false } = {}) {
+export function createCaptureStreams(filePaths, { enablePingHost = false, enablePingHostSide = false } = {}) {
   const streams = {
     logcatAll: createWriteStream(filePaths.logcatAll, 'a'),
     logcatErr: createWriteStream(filePaths.logcatErr, 'a')
@@ -28,6 +29,7 @@ export function createCaptureStreams(filePaths, { enablePingHost = false } = {})
   for (const [name, p] of Object.entries(filePaths)) {
     if (name === 'outDir' || name === 'logcatAll' || name === 'logcatErr' || name === 'meta') continue;
     if (name === 'pingHost' && !enablePingHost) continue;
+    if (name === 'pingHostSide' && !enablePingHostSide) continue;
     streams[name] = createWriteStream(p, 'a');
   }
   return streams;

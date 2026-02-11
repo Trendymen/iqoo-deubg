@@ -39,6 +39,7 @@ export function buildReportFiles(logDir) {
     alarm: path.join(logDir, 'dumpsys_alarm.log'),
     jobs: path.join(logDir, 'dumpsys_jobs.log'),
     pingHost: path.join(logDir, 'ping_host.log'),
+    pingHostSide: path.join(logDir, 'ping_host_side.log'),
     captureMeta: path.join(logDir, 'capture_meta.json'),
     timelineCsv: path.join(logDir, 'timeline.csv'),
     timelineSessionCsv: path.join(logDir, 'timeline_session.csv'),
@@ -51,6 +52,8 @@ export function buildReportFiles(logDir) {
     streamWindowsEffectiveCsv: path.join(logDir, 'stream_windows_effective.csv'),
     pingLatencyCsv: path.join(logDir, 'ping_latency.csv'),
     pingLatencySessionCsv: path.join(logDir, 'ping_latency_session.csv'),
+    pingLatencyHostSideCsv: path.join(logDir, 'ping_latency_host_side.csv'),
+    pingLatencyHostSideSessionCsv: path.join(logDir, 'ping_latency_host_side_session.csv'),
     reportMd: path.join(logDir, 'report.md'),
     analysisMeta: path.join(logDir, 'analysis_meta.json')
   };

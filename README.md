@@ -7,16 +7,17 @@
 本项目聚焦“可复盘”的网络抖动排查，核心是把 App 日志、系统状态和网络时延放到同一时间线上做联合分析：
 
 - 统一采集：同时抓取 `logcat` 与多类 `dumpsys`（wifi/connectivity/deviceidle/power/alarm/jobscheduler）。
-- 连续延迟采样：可选开启手机侧 `adb shell ping`，记录 `ping_host.log`，用于秒级抖动定位。
+- 连续延迟采样：支持手机侧 `adb shell ping` 与 Windows 11 主机侧协同 `nping` 同启同停。
+- 双端时间对齐：手机侧和主机侧 ping 原始日志统一逐行写入 `+08:00` 与 `epoch_ms`。
 - App 专项分析：从 `logcat_all.log` 抽取 Moonlight/LimeLog 指标与异常，生成 `app_focus.log`、`app_metrics.csv`、`internal_stats.csv`。
 - 关联归因：自动对齐 Ping 抖动/高延迟、系统状态切换和 App 异常，输出原因排序与证据。
-- 独立批次产物：每次采集生成时间戳目录，便于横向对比不同网络环境和设置。
 
 ## 环境要求
 
 - Node.js `>=20`
 - 已安装 Android Platform Tools（`adb` 在 PATH）
 - Android 手机已开启 USB 调试并授权
+- 若启用主机侧协同 ping，目标主机必须是 Windows 11 且已部署 OpenSSH + Nmap/nping
 
 安装依赖：
 
@@ -24,59 +25,60 @@
 npm install
 ```
 
-## 快速开始（推荐流程）
+## 快速开始
 
-1. 配置 `capture.config.json`（建议先填好主机 IP）：
+1. 配置 `capture.config.json`：
 
 ```json
 {
+  "pingLogTzOffset": "+08:00",
   "hostPing": {
     "enabled": false,
     "hostIp": "192.168.5.25",
     "intervalSec": 0.2
+  },
+  "hostSidePing": {
+    "enabled": false,
+    "hostIp": "192.168.5.23",
+    "intervalSec": 0.2,
+    "sshHost": "192.168.5.25",
+    "sshPort": 22,
+    "sshUser": "iqoo_ping",
+    "sshKeyPath": "~/.ssh/id_rsa",
+    "remoteScriptDir": "C:\\iqoo-ping"
   }
 }
 ```
 
-2. 执行采集（推荐带 ping）：
+2. 执行采集：
 
 ```bash
+# 仅基础采集
+npm run capture
+
+# 手机侧 ping 协同采集
 npm run capture:ping
 ```
 
-3. 采集结束后会自动触发报告解析；你也可以手动重跑最新目录：
-
-```bash
-npm run report
-```
-
-## 常用命令
-
-### 采集
-
-- 默认采集（15 分钟）：`npm run capture`
-- 采集并启用 host ping：`npm run capture:ping`
-- 自定义参数：
+3. 执行双端协同（手机 + Windows 主机）：
 
 ```bash
 node capture.js \
-  --minutes 20 \
-  --out ./logs \
+  --minutes 15 \
   --host-ping \
   --host-ip 192.168.5.25 \
-  --ping-interval 0.2
+  --ping-interval 0.2 \
+  --host-side-ping \
+  --host-side-ip 192.168.5.88 \
+  --host-side-interval 0.2 \
+  --host-side-ssh-host 192.168.5.25 \
+  --host-side-ssh-port 22 \
+  --host-side-ssh-user iqoo_ping \
+  --host-side-ssh-key ~/.ssh/id_rsa \
+  --ping-log-tz-offset +08:00
 ```
 
-关键参数：
-
-- `--minutes`：采集时长（分钟）
-- `--out`：输出根目录（默认 `./logs`）
-- `--config`：配置文件路径（默认 `./capture.config.json`）
-- `--host-ping`：启用 `adb shell ping`
-- `--host-ip`：被 ping 的主机 IP（Sunshine 主机或路由器 LAN IP）
-- `--ping-interval`：ping 间隔（秒）
-
-### 报告解析
+4. 报告解析：
 
 ```bash
 # 解析最新一次采集目录
@@ -86,14 +88,19 @@ npm run report
 node parse_report.js --dir ./logs/20260211_163149
 ```
 
-可选高级参数（按需）：
+## 关键参数
 
-- `--stream-window-mode auto|strict|all`：串流窗口识别模式。`auto` 自动平衡召回/精度（默认），`strict` 更严格只保留高置信窗口，`all` 尽量不过滤窗口。
-- `--noise-policy balanced|aggressive|conservative`：App 日志降噪策略。`balanced` 平衡模式（默认），`aggressive` 更激进去噪，`conservative` 更保守保留更多原始信号。
-- `--session-pre-buffer-sec`：会话窗口前置缓冲秒数（默认 `5`），用于把会话开始前的上下文事件纳入分析。
-- `--session-post-buffer-sec`：会话窗口后置缓冲秒数（默认 `10`），用于把会话结束后的尾部影响纳入分析。
-- `--clock-skew-tolerance-sec`：时间戳对齐容差秒数（默认 `2`），用于缓解不同日志源的时钟偏移。
-- `--no-valid-session-policy empty-main|degraded`：未识别到有效会话时的处理策略。`empty-main` 主分析置空（默认），`degraded` 退化到较宽松分析并尽量给出线索。
+- `--host-ping`：启用手机侧 `adb shell ping`
+- `--host-ip`：手机侧 ping 目标 IP（Sunshine 主机或路由器 LAN IP）
+- `--ping-interval`：手机侧 ping 间隔（秒）
+- `--host-side-ping`：启用 Windows 11 主机侧协同 ping
+- `--host-side-ip`：主机侧 ping 目标 IP（通常为手机 Wi-Fi IP）
+- `--host-side-interval`：主机侧 ping 间隔（秒）
+- `--host-side-ssh-host`：Windows 主机 SSH 地址
+- `--host-side-ssh-port`：Windows 主机 SSH 端口
+- `--host-side-ssh-user`：Windows 主机 SSH 用户
+- `--host-side-ssh-key`：SSH 私钥路径
+- `--ping-log-tz-offset`：ping 日志时区偏移（默认 `+08:00`）
 
 ## 输出目录与关键文件
 
@@ -110,7 +117,8 @@ logs/20260211_163149/
   dumpsys_power.log
   dumpsys_alarm.log
   dumpsys_jobs.log
-  ping_host.log                  # 启用 host ping 时存在
+  ping_host.log
+  ping_host_side.log
   report.md
   analysis_meta.json
   timeline.csv
@@ -124,32 +132,120 @@ logs/20260211_163149/
   internal_stats.csv
   ping_latency.csv
   ping_latency_session.csv
+  ping_latency_host_side.csv
+  ping_latency_host_side_session.csv
 ```
 
 排障时优先看：
 
-- `report.md`：总览结论与原因排序
-- `analysis_meta.json`：结构化分析结果（便于脚本二次处理）
-- `ping_latency.csv`：延迟/抖动样本明细
-- `timeline.csv`：系统事件时间线（分钟粒度）
-- `app_metrics.csv` 与 `internal_stats.csv`：Moonlight/LimeLog 指标
+- `report.md`
+- `analysis_meta.json`
+- `ping_latency.csv` 与 `ping_latency_host_side.csv`
+- `timeline.csv`
+- `app_metrics.csv` 与 `internal_stats.csv`
 
-## 抖动归因方法（简版）
+## 双端日志时间格式（强制）
 
-报告会围绕串流有效窗口做“同窗关联”，核心检查：
+手机侧 `ping_host.log` 与主机侧 `ping_host_side.log` 都按统一格式逐行写入：
 
-- Ping 高延迟/抖动点
-- Doze/Idle、Wi-Fi/Connectivity 切换事件
-- Moonlight/LimeLog 异常与性能指标
+```text
+[ts_local=YYYY-MM-DD HH:mm:ss.SSS +08:00][epoch_ms=1739271685123][source=device_side_ping|host_side_ping] <raw line>
+```
 
-并输出可疑原因排序（例如：网络路径抖动、RTT 方差突发、解码渲染过载、系统状态切换干扰）。
+## Windows 11 主机部署章节（固化版）
 
-## 建议采集规范
+### 1) 部署目标
 
-- 采集时尽量完整覆盖“开始串流 -> 发生卡顿 -> 恢复/结束”全过程（建议 >= 10 分钟）。
-- 优先使用 `npm run capture:ping`，否则网络层证据会明显不足。
-- 尽量避免采集中频繁切前后台，减少会话识别缺失。
-- 若设备允许，开启 Wi-Fi verbose logging。
+- 允许采集机通过 SSH 远程启动/停止主机侧高频 ping。
+- 主机日志可直接用于同窗对齐分析（`+08:00` + `epoch_ms`）。
+
+### 2) 一次性安装与系统配置
+
+管理员 PowerShell 执行：
+
+```powershell
+Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+Start-Service sshd
+Set-Service -Name sshd -StartupType Automatic
+New-NetFirewallRule -Name sshd -DisplayName "OpenSSH Server (sshd)" -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22
+winget install -e --id Insecure.Nmap
+nping --version
+```
+
+### 3) 账号与安全基线
+
+- 创建专用低权限账号（示例：`iqoo_ping`），不要使用管理员账号。
+- 启用 SSH 公钥登录并禁用密码登录。
+- 将采集机公钥写入 `C:\Users\iqoo_ping\.ssh\authorized_keys`。
+- 将防火墙规则收敛为仅允许采集机 IP。
+- `sshd_config` 最低要求：
+  - `PubkeyAuthentication yes`
+  - `PasswordAuthentication no`
+  - `AllowUsers iqoo_ping`
+- 修改后重启服务：
+
+```powershell
+Restart-Service sshd
+```
+
+### 4) 主机脚本部署规范
+
+- 目录固定：`C:\iqoo-ping\`
+- 脚本固定：
+  - `start_host_ping.ps1`
+  - `stop_host_ping.ps1`
+  - `status_host_ping.ps1`
+- 本仓库脚本路径：`scripts/windows/*.ps1`
+- 复制到主机目录（在 Windows 主机执行）：
+
+```powershell
+New-Item -ItemType Directory -Path C:\iqoo-ping -Force
+Copy-Item .\scripts\windows\*.ps1 C:\iqoo-ping\ -Force
+```
+
+`start_host_ping.ps1` 入参：`TargetIp`、`IntervalMs`、`LogFile`、`PidFile`、`TzOffset`  
+`stop_host_ping.ps1` 行为：按 PID 优雅停止，超时后强制停止  
+`status_host_ping.ps1` 行为：返回 running/stopped 与 PID
+
+### 5) 主机日志格式（强制）
+
+每行格式：
+
+```text
+[ts_local=YYYY-MM-DD HH:mm:ss.SSS +08:00][epoch_ms=1739271685123][source=host_side_ping] <raw nping line>
+```
+
+- 每行必须带 `ts_local` 与 `epoch_ms`。
+- 主机脚本内部强制按 `China Standard Time` 输出 `+08:00`。
+
+### 6) Windows 侧验收清单
+
+- 采集机可 SSH 登录：`ssh -i <key> iqoo_ping@<win_host>`
+- 远程执行 `nping --version` 成功
+- 远程启动脚本后 `ping_host_side.log` 持续增长
+- 远程停止脚本后主机 ping 进程退出，PID 文件清理
+- 日志抽样 20 行，全部具备 `+08:00` 与 `epoch_ms`
+
+### 7) 回滚方案
+
+- 停止并禁用 `sshd` 服务
+- 删除防火墙规则
+- 删除 `C:\iqoo-ping\` 与专用账号
+- 恢复为仅手机侧 ping 模式（不传 `--host-side-ping`）
+
+## 报告能力（双向归因）
+
+报告新增以下内容：
+
+- 主机侧 ping CSV：`ping_latency_host_side.csv`、`ping_latency_host_side_session.csv`
+- 主机侧协同 Ping 章节（会话内统计）
+- 双向链路判定（`bidirectional` / `device_uplink_dominant` / `host_downlink_dominant` 等）
+
+兼容性：旧目录即使只有 `ping_host.log`，`npm run report` 仍可成功。
+
+## 失败策略
+
+- 当 `--host-side-ping` 启用但 SSH/PowerShell/nping/脚本不可用时，采集会 **fail-fast** 并明确报错，不做静默降级。
 
 ## AI 快捷评估口令
 
@@ -159,5 +255,3 @@ logs/20260211_163149/
 - `分析最近一次报告`
 - `检查最新网络抖动原因`
 - `执行：最近一次抖动归因评估`
-
-该流程会自动定位 `logs/` 最新目录，必要时补跑 `npm run report`，并给出基于证据的可疑原因排序和下一步采集建议。

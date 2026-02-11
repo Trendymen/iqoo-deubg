@@ -164,7 +164,10 @@ export function buildMarkdownReport({
   degradedAnalysis,
   pingFocus,
   pingFocusAll,
+  hostSidePingFocus,
+  hostSidePingFocusAll,
   pingAnalysis,
+  bidirectionalPingAnalysis,
   mainAnalysisAvailable,
   noValidSessionReason,
   noValidSessionPolicy,
@@ -267,6 +270,8 @@ export function buildMarkdownReport({
     lines.push('## 3) 会话内主分析：Ping 与 App 同窗');
     lines.push(`- Ping 全量 CSV: ${outputFiles.pingLatencyCsv}`);
     lines.push(`- Ping 会话内 CSV: ${outputFiles.pingLatencySessionCsv}`);
+    lines.push(`- 主机侧 Ping 全量 CSV: ${outputFiles.pingLatencyHostSideCsv}`);
+    lines.push(`- 主机侧 Ping 会话内 CSV: ${outputFiles.pingLatencyHostSideSessionCsv}`);
     if (!pingFocus.exists || (pingFocus.sampleCount || 0) === 0) {
       lines.push('- 会话内无可用 ping 样本。');
     } else {
@@ -295,6 +300,48 @@ export function buildMarkdownReport({
       } else {
         lines.push('- 自动识别: 会话内未发现显著 ping 异常。');
       }
+    }
+    lines.push('');
+    if (!hostSidePingFocus.exists || (hostSidePingFocus.sampleCount || 0) === 0) {
+      lines.push('- 主机侧协同 ping: 无可用样本（可忽略，表示本次未启用 host-side ping）。');
+    } else {
+      const hostSide = (bidirectionalPingAnalysis && bidirectionalPingAnalysis.hostSide) || {};
+      const hostSideTable = [
+        ['指标', '值'],
+        ['sample_count', String(hostSide.sampleCount || 0)],
+        ['success_count', String(hostSide.successCount || 0)],
+        ['failure_count', String(hostSide.failureCount || 0)],
+        ['p50_ms', toFixedOrNA(hostSide.p50Ms)],
+        ['p95_ms', toFixedOrNA(hostSide.p95Ms)],
+        ['max_ms', toFixedOrNA(hostSide.maxMs)],
+        ['high_latency_bursts', String(hostSide.highLatencyBurstCount || 0)]
+      ];
+      lines.push('### 主机侧协同 Ping 指标');
+      lines.push(markdownTable(hostSideTable, { align: ['l', 'r'] }));
+    }
+    lines.push('');
+    lines.push('### 双向链路判定');
+    if (bidirectionalPingAnalysis) {
+      const cls = bidirectionalPingAnalysis.classification || {};
+      const overlap = bidirectionalPingAnalysis.overlap || {};
+      const sampleAlignment = bidirectionalPingAnalysis.sampleAlignment || {};
+      lines.push(`- 方向判定: ${cls.direction || 'inconclusive'}`);
+      lines.push(`- 置信度: ${cls.confidence || 'low'}`);
+      lines.push(`- 判定说明: ${cls.detail || 'N/A'}`);
+      lines.push(`- 双端高延迟段重叠率: ${toFixedOrNA((overlap.overlapRatio || 0) * 100)}%`);
+      lines.push(`- 双端样本配对窗口: ±${String(sampleAlignment.windowMs || bidirectionalPingAnalysis.sampleAlignWindowMs || 0)}ms`);
+      lines.push(`- 双端配对样本数: ${String(sampleAlignment.pairedCount || 0)}`);
+      lines.push(`- 设备侧配对覆盖率: ${toFixedOrNA((sampleAlignment.deviceCoverage || 0) * 100)}%`);
+      lines.push(`- 主机侧配对覆盖率: ${toFixedOrNA((sampleAlignment.hostSideCoverage || 0) * 100)}%`);
+      const biFindings = bidirectionalPingAnalysis.findings || [];
+      if (biFindings.length > 0) {
+        lines.push('- 双向附加发现:');
+        biFindings.forEach((x) => lines.push(`- [${x.level}] ${x.type}: ${x.detail}`));
+      } else {
+        lines.push('- 双向附加发现: 无');
+      }
+    } else {
+      lines.push('- 双向链路判定: 无可用结果');
     }
     lines.push('');
 
@@ -329,6 +376,12 @@ export function buildMarkdownReport({
   lines.push(`- App 会话内 metric 样本: ${(appFocus && appFocus.metricSamples && appFocus.metricSamples.length) || 0}`);
   lines.push(`- Ping 全量样本: ${(pingFocusAll && pingFocusAll.sampleCount) || 0}`);
   lines.push(`- Ping 会话内样本: ${(pingFocus && pingFocus.sampleCount) || 0}`);
+  lines.push(`- 主机侧 Ping 全量样本: ${(hostSidePingFocusAll && hostSidePingFocusAll.sampleCount) || 0}`);
+  lines.push(`- 主机侧 Ping 会话内样本: ${(hostSidePingFocus && hostSidePingFocus.sampleCount) || 0}`);
+  const alignmentSummary = (bidirectionalPingAnalysis && bidirectionalPingAnalysis.sampleAlignment) || {};
+  lines.push(`- 双端配对样本(会话内): ${alignmentSummary.pairedCount || 0}`);
+  lines.push(`- 双端配对窗口: ±${String(alignmentSummary.windowMs || bidirectionalPingAnalysis?.sampleAlignWindowMs || 0)}ms`);
+  lines.push(`- 双端未配对样本(设备/主机): ${(alignmentSummary.deviceUnpairedCount || 0)}/${(alignmentSummary.hostSideUnpairedCount || 0)}`);
   lines.push('');
   lines.push(markdownTable(buildDumpsysCounterTable(eventCountAll, eventCountSession, eventCountOutside), { align: ['l', 'r', 'r', 'r'] }));
   lines.push('');
@@ -363,6 +416,10 @@ export function buildMarkdownReport({
   if (captureMeta && captureMeta.hostPing) {
     const hp = captureMeta.hostPing;
     lines.push(`- host ping 配置: enabled=${hp.enabled ? 'true' : 'false'}, hostIp=${hp.hostIp || 'N/A'}, intervalSec=${hp.intervalSec == null ? 'N/A' : hp.intervalSec}`);
+  }
+  if (captureMeta && captureMeta.hostSidePing) {
+    const hs = captureMeta.hostSidePing;
+    lines.push(`- host-side ping 配置: enabled=${hs.enabled ? 'true' : 'false'}, targetIp=${hs.hostIp || 'N/A'}, intervalSec=${hs.intervalSec == null ? 'N/A' : hs.intervalSec}, ssh=${hs.sshUser || 'N/A'}@${hs.sshHost || 'N/A'}:${hs.sshPort == null ? 'N/A' : hs.sshPort}`);
   }
   lines.push('');
 

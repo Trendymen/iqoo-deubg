@@ -1,7 +1,18 @@
 {
+  "pingLogTzOffset": "+08:00",
   "hostPing": {
-    "enabled": false,
+    "enabled": true,
     "hostIp": "192.168.5.25",
     "intervalSec": 0.2
+  },
+  "hostSidePing": {
+    "enabled": true,
+    "hostIp": "192.168.5.23",
+    "intervalSec": 0.2,
+    "sshHost": "192.168.5.25",
+    "sshPort": 22,
+    "sshUser": "iqoo_ping",
+    "sshKeyPath": "~/.ssh/id_rsa",
+    "remoteScriptDir": "C:\\iqoo-ping"
   }
 }

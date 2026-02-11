@@ -10,6 +10,9 @@ import { buildCapturePaths, createCaptureStreams } from './files.js';
 import { createCaptureMeta } from './meta.js';
 import { runParseReport } from './report-runner.js';
 
+const TZ_OFFSET_REGEX = /^[+-](\d{2}):(\d{2})$/;
+const PREFXED_LOG_LINE_REGEX = /^\[ts_local=[^\]]+\]\[epoch_ms=\d+\](?:\[source=[^\]]+\])?\s/;
+
 async function runDumpsysTask({ task, stat, serial, streams }) {
   const started = Date.now();
   let status = 'OK';
@@ -50,17 +53,120 @@ function normalizePingIntervalSec(intervalSec) {
   return value.toFixed(3).replace(/\.?0+$/, '');
 }
 
-function buildPingShellCommand({ hostIp, intervalSec }) {
+function buildDevicePingArgs({ hostIp, intervalSec }) {
   const normalizedInterval = normalizePingIntervalSec(intervalSec);
-  return `ping -i ${normalizedInterval} -D ${hostIp} || ping -i ${normalizedInterval} ${hostIp}`;
+  return ['ping', '-i', normalizedInterval, hostIp];
 }
 
-function startHostPingProcess({ serial, hostPing, streams, meta }) {
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+function pad3(n) {
+  return String(n).padStart(3, '0');
+}
+
+function parseTzOffsetToMinutes(rawOffset) {
+  const text = String(rawOffset || '+08:00').trim();
+  const m = text.match(TZ_OFFSET_REGEX);
+  if (!m) return 8 * 60;
+  const sign = text.startsWith('-') ? -1 : 1;
+  const hours = Number(m[1]);
+  const minutes = Number(m[2]);
+  return sign * (hours * 60 + minutes);
+}
+
+function formatTsWithOffset(epochMs, offsetMinutes) {
+  const shifted = new Date(epochMs + offsetMinutes * 60 * 1000);
+  const year = shifted.getUTCFullYear();
+  const month = pad2(shifted.getUTCMonth() + 1);
+  const day = pad2(shifted.getUTCDate());
+  const hour = pad2(shifted.getUTCHours());
+  const minute = pad2(shifted.getUTCMinutes());
+  const second = pad2(shifted.getUTCSeconds());
+  const ms = pad3(shifted.getUTCMilliseconds());
+  const sign = offsetMinutes < 0 ? '-' : '+';
+  const abs = Math.abs(offsetMinutes);
+  const tzH = pad2(Math.floor(abs / 60));
+  const tzM = pad2(abs % 60);
+  return `${year}-${month}-${day} ${hour}:${minute}:${second}.${ms} ${sign}${tzH}:${tzM}`;
+}
+
+function writePrefixedLogLine(stream, rawLine, { source, tzOffsetMinutes }) {
+  const line = String(rawLine || '');
+  if (!line) return;
+  if (PREFXED_LOG_LINE_REGEX.test(line)) {
+    stream.write(line.endsWith('\n') ? line : `${line}\n`);
+    return;
+  }
+  const epochMs = Date.now();
+  const tsLocal = formatTsWithOffset(epochMs, tzOffsetMinutes);
+  stream.write(`[ts_local=${tsLocal}][epoch_ms=${epochMs}][source=${source}] ${line}\n`);
+}
+
+function bindProcessOutputWithPrefix(proc, stream, { source, tzOffsetMinutes }) {
+  let stdoutBuffer = '';
+  let stderrBuffer = '';
+
+  const flushLines = (buffer, chunk, writer) => {
+    const text = buffer + String(chunk || '');
+    const lines = text.split(/\r?\n/);
+    const remain = lines.pop() || '';
+    lines.forEach((line) => writer(line));
+    return remain;
+  };
+
+  if (proc.stdout) {
+    proc.stdout.on('data', (chunk) => {
+      stdoutBuffer = flushLines(stdoutBuffer, chunk, (line) => {
+        writePrefixedLogLine(stream, line, { source, tzOffsetMinutes });
+      });
+    });
+    proc.stdout.on('end', () => {
+      if (stdoutBuffer) {
+        writePrefixedLogLine(stream, stdoutBuffer, { source, tzOffsetMinutes });
+        stdoutBuffer = '';
+      }
+    });
+  }
+  if (proc.stderr) {
+    proc.stderr.on('data', (chunk) => {
+      stderrBuffer = flushLines(stderrBuffer, chunk, (line) => {
+        writePrefixedLogLine(stream, line, { source, tzOffsetMinutes });
+      });
+    });
+    proc.stderr.on('end', () => {
+      if (stderrBuffer) {
+        writePrefixedLogLine(stream, stderrBuffer, { source, tzOffsetMinutes });
+        stderrBuffer = '';
+      }
+    });
+  }
+}
+
+function buildSshArgs(hostSidePing, remoteArgs) {
+  const target = `${hostSidePing.sshUser}@${hostSidePing.sshHost}`;
+  return [
+    '-p', String(hostSidePing.sshPort),
+    '-i', hostSidePing.sshKeyPath,
+    '-o', 'BatchMode=yes',
+    '-o', 'StrictHostKeyChecking=accept-new',
+    target,
+    ...remoteArgs
+  ];
+}
+
+function buildRemoteScriptPath(hostSidePing, scriptName) {
+  const dir = String(hostSidePing.remoteScriptDir || 'C:\\iqoo-ping').replace(/[\\/]+$/, '');
+  return `${dir}\\${scriptName}`;
+}
+
+function startDeviceHostPingProcess({ serial, hostPing, streams, meta, pingLogTzOffset }) {
   if (!hostPing || !hostPing.enabled || !hostPing.hostIp) return null;
 
-  const pingCmd = buildPingShellCommand(hostPing);
+  const pingArgs = buildDevicePingArgs(hostPing);
   console.log(`[capture] 启动 host ping: ip=${hostPing.hostIp}, interval=${normalizePingIntervalSec(hostPing.intervalSec)}s`);
-  const pingProc = execa('adb', adbArgsForSerial(serial, ['shell', 'sh', '-c', pingCmd]), {
+  const pingProc = execa('adb', adbArgsForSerial(serial, ['shell', ...pingArgs]), {
     stdout: 'pipe',
     stderr: 'pipe',
     buffer: false,
@@ -68,14 +174,170 @@ function startHostPingProcess({ serial, hostPing, streams, meta }) {
     windowsHide: true
   });
 
-  if (pingProc.stdout) pingProc.stdout.pipe(streams.pingHost, { end: false });
-  if (pingProc.stderr) pingProc.stderr.pipe(streams.pingHost, { end: false });
+  bindProcessOutputWithPrefix(pingProc, streams.pingHost, {
+    source: 'device_side_ping',
+    tzOffsetMinutes: parseTzOffsetToMinutes(pingLogTzOffset)
+  });
 
   meta.hostPing.startedAtIso = new Date().toISOString();
   return {
     proc: pingProc,
     exitPromise: pingProc.catch(() => null)
   };
+}
+
+async function verifyHostSidePingReady(hostSidePing) {
+  if (!hostSidePing || !hostSidePing.enabled) return;
+
+  const startScriptPath = buildRemoteScriptPath(hostSidePing, 'start_host_ping.ps1');
+  const stopScriptPath = buildRemoteScriptPath(hostSidePing, 'stop_host_ping.ps1');
+  const statusScriptPath = buildRemoteScriptPath(hostSidePing, 'status_host_ping.ps1');
+  console.log(`[capture] 检查 host-side SSH 连通: ${hostSidePing.sshUser}@${hostSidePing.sshHost}:${hostSidePing.sshPort}`);
+
+  const psProbeArgs = buildSshArgs(hostSidePing, [
+    'powershell',
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-Command',
+    '$PSVersionTable.PSVersion.ToString()'
+  ]);
+  const psProbe = await execa('ssh', psProbeArgs, {
+    timeout: 20000,
+    reject: false,
+    windowsHide: true
+  });
+  if (psProbe.exitCode !== 0) {
+    throw new Error(`host-side SSH PowerShell 检查失败: ${String(psProbe.stderr || psProbe.stdout || 'unknown error').trim()}`);
+  }
+
+  const npingCheckArgs = buildSshArgs(hostSidePing, [
+    'powershell',
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-Command',
+    'nping --version'
+  ]);
+  const npingCheck = await execa('ssh', npingCheckArgs, {
+    timeout: 20000,
+    reject: false,
+    windowsHide: true
+  });
+  if (npingCheck.exitCode !== 0) {
+    throw new Error(`host-side nping 检查失败，请确认 Windows 主机已安装 Nmap/nping: ${String(npingCheck.stderr || npingCheck.stdout || 'unknown error').trim()}`);
+  }
+
+  const statusCheckArgs = buildSshArgs(hostSidePing, [
+    'powershell',
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-File',
+    statusScriptPath
+  ]);
+  const statusCheck = await execa('ssh', statusCheckArgs, {
+    timeout: 20000,
+    reject: false,
+    windowsHide: true
+  });
+  if (statusCheck.exitCode !== 0) {
+    throw new Error(`host-side status 脚本检查失败，请确认脚本已部署: ${statusScriptPath}`);
+  }
+
+  const startProbeArgs = buildSshArgs(hostSidePing, [
+    'powershell',
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-Command',
+    `if (!(Test-Path '${startScriptPath}')) { exit 3 }; if (!(Test-Path '${stopScriptPath}')) { exit 4 }`
+  ]);
+  const startProbe = await execa('ssh', startProbeArgs, {
+    timeout: 20000,
+    reject: false,
+    windowsHide: true
+  });
+  if (startProbe.exitCode !== 0) {
+    throw new Error(`host-side start/stop 脚本不存在，请检查 ${hostSidePing.remoteScriptDir}`);
+  }
+}
+
+function startHostSidePingProcess({ hostSidePing, streams, meta, pingLogTzOffset }) {
+  if (!hostSidePing || !hostSidePing.enabled) return null;
+
+  const startScriptPath = buildRemoteScriptPath(hostSidePing, 'start_host_ping.ps1');
+  const remoteLogPath = buildRemoteScriptPath(hostSidePing, 'host_side_ping.log');
+  const remotePidPath = buildRemoteScriptPath(hostSidePing, 'host_side_ping.pid');
+  const intervalMs = Math.max(1, Math.round(Number(hostSidePing.intervalSec || 0.2) * 1000));
+  console.log(`[capture] 启动 host-side ping: ssh=${hostSidePing.sshUser}@${hostSidePing.sshHost}:${hostSidePing.sshPort}, target=${hostSidePing.hostIp}, interval=${normalizePingIntervalSec(hostSidePing.intervalSec)}s`);
+
+  const sshArgs = buildSshArgs(hostSidePing, [
+    'powershell',
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-File',
+    startScriptPath,
+    '-TargetIp',
+    hostSidePing.hostIp,
+    '-IntervalMs',
+    String(intervalMs),
+    '-LogFile',
+    remoteLogPath,
+    '-PidFile',
+    remotePidPath,
+    '-TzOffset',
+    pingLogTzOffset
+  ]);
+  const hostSideProc = execa('ssh', sshArgs, {
+    stdout: 'pipe',
+    stderr: 'pipe',
+    buffer: false,
+    reject: false,
+    windowsHide: true
+  });
+
+  bindProcessOutputWithPrefix(hostSideProc, streams.pingHostSide, {
+    source: 'host_side_ping',
+    tzOffsetMinutes: parseTzOffsetToMinutes(pingLogTzOffset)
+  });
+
+  meta.hostSidePing.startedAtIso = new Date().toISOString();
+  return {
+    proc: hostSideProc,
+    exitPromise: hostSideProc.catch(() => null),
+    remotePidPath
+  };
+}
+
+async function stopHostSidePingRemote(hostSidePing, remotePidPath) {
+  if (!hostSidePing || !hostSidePing.enabled) return;
+  const stopScriptPath = buildRemoteScriptPath(hostSidePing, 'stop_host_ping.ps1');
+  const sshArgs = buildSshArgs(hostSidePing, [
+    'powershell',
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-File',
+    stopScriptPath,
+    '-PidFile',
+    remotePidPath || buildRemoteScriptPath(hostSidePing, 'host_side_ping.pid')
+  ]);
+  const result = await execa('ssh', sshArgs, {
+    timeout: 20000,
+    reject: false,
+    windowsHide: true
+  });
+  if (result.exitCode !== 0) {
+    console.warn('[capture] host-side stop 脚本返回非零:', String(result.stderr || result.stdout || '').trim());
+  }
 }
 
 async function terminateSubprocess(proc, exitPromise) {
@@ -107,17 +369,25 @@ async function terminateSubprocess(proc, exitPromise) {
   await Promise.race([exitPromise, sleep(1500)]);
 }
 
-export async function runCaptureFlow({ minutes, out, serial, devices, hostPing }) {
+export async function runCaptureFlow({ minutes, out, serial, devices, hostPing, hostSidePing, pingLogTzOffset }) {
+  const pingTzOffset = pingLogTzOffset || '+08:00';
+  await verifyHostSidePingReady(hostSidePing);
+
   const startedAt = new Date();
   const filePaths = buildCapturePaths(out, startedAt);
-  const streams = createCaptureStreams(filePaths, { enablePingHost: Boolean(hostPing && hostPing.enabled) });
+  const streams = createCaptureStreams(filePaths, {
+    enablePingHost: Boolean(hostPing && hostPing.enabled),
+    enablePingHostSide: Boolean(hostSidePing && hostSidePing.enabled)
+  });
   const meta = createCaptureMeta({
     startedAtIso: startedAt.toISOString(),
     outDir: filePaths.outDir,
     minutes,
     serial,
     devices,
-    hostPing
+    hostPing,
+    hostSidePing,
+    pingLogTzOffset: pingTzOffset
   });
   writeJson(filePaths.meta, meta);
 
@@ -140,7 +410,13 @@ export async function runCaptureFlow({ minutes, out, serial, devices, hostPing }
   if (logcatProc.stdout) logcatProc.stdout.pipe(streams.logcatAll, { end: false });
   if (logcatProc.stderr) logcatProc.stderr.pipe(streams.logcatErr, { end: false });
   const logcatExitPromise = logcatProc.catch(() => null);
-  const pingRuntime = startHostPingProcess({ serial, hostPing, streams, meta });
+  const pingRuntime = startDeviceHostPingProcess({ serial, hostPing, streams, meta, pingLogTzOffset: pingTzOffset });
+  const hostSidePingRuntime = startHostSidePingProcess({
+    hostSidePing,
+    streams,
+    meta,
+    pingLogTzOffset: pingTzOffset
+  });
 
   const queue = new PQueue({ concurrency: 1 });
   const state = {
@@ -205,6 +481,25 @@ export async function runCaptureFlow({ minutes, out, serial, devices, hostPing }
         meta.hostPing.exitCode = pingRuntime.proc.exitCode;
       }
       meta.hostPing.stoppedAtIso = new Date().toISOString();
+    }
+    if (hostSidePingRuntime) {
+      try {
+        await terminateSubprocess(hostSidePingRuntime.proc, hostSidePingRuntime.exitPromise);
+      } catch (err) {
+        console.warn('[capture] 结束 host-side SSH 子进程时出现异常:', String(err.message || err));
+      }
+      try {
+        await stopHostSidePingRemote(hostSidePing, hostSidePingRuntime.remotePidPath);
+      } catch (err) {
+        console.warn('[capture] 调用 host-side stop 脚本时出现异常:', String(err.message || err));
+      }
+      const hostSideResult = await Promise.race([hostSidePingRuntime.exitPromise, sleep(800)]);
+      if (hostSideResult && typeof hostSideResult.exitCode === 'number') {
+        meta.hostSidePing.exitCode = hostSideResult.exitCode;
+      } else if (hostSidePingRuntime.proc && typeof hostSidePingRuntime.proc.exitCode === 'number') {
+        meta.hostSidePing.exitCode = hostSidePingRuntime.proc.exitCode;
+      }
+      meta.hostSidePing.stoppedAtIso = new Date().toISOString();
     }
 
     meta.endedAtIso = new Date().toISOString();
