@@ -2,23 +2,28 @@ import fs from 'node:fs';
 import readline from 'node:readline';
 import { parseThreadtimeDate } from '../shared/time.js';
 
-const APP_LINE_REGEX = /(com\.limelight|limelight\.qiin|moonlight-common-c)/i;
+const APP_LINE_HINT_REGEX = /(com\.limelight|limelight\.qiin|moonlight-common-c|LimeLog|NvConnection|MediaCodecDecoderRenderer|\[STREAM_SESSION\])/i;
+const APP_TAG_HINT_REGEX = /(LimeLog|moonlight-common-c|NvConnection|MediaCodecDecoderRenderer|com\.limelight)/i;
+const STREAM_MARKER_HINT_REGEX = /(\[INTERNAL_STATS\]|\[STREAM_SESSION\]|Launched new game session|Resumed existing game session|Connection terminated|stage .* failed|Average end-to-end client latency|Average hardware decoder latency|Configuring with format|Using codec)/i;
 const THREADTIME_DETAIL_REGEX = /^\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3}\s+\d+\s+\d+\s+[VDIWEAF]\s+([^:]+):\s?(.*)$/;
 
-const STRONG_START_REGEX = /\[INTERNAL_STATS\]/i;
+const STRONG_START_REGEX = /(\[INTERNAL_STATS\]|\[STREAM_SESSION\]\s*(CONNECTED|HEARTBEAT|APP_SESSION_READY))/i;
 const MID_START_REGEX_LIST = [
   /Configuring with format/i,
   /Using codec/i,
   /Average end-to-end client latency/i,
-  /Average hardware decoder latency/i
+  /Average hardware decoder latency/i,
+  /\[STREAM_SESSION\]\s*(CONNECT_REQUEST|CONNECT_PIPELINE_START)/i
 ];
 const WEAK_START_REGEX_LIST = [
   /Launched new game session/i,
-  /Resumed existing game session/i
+  /Resumed existing game session/i,
+  /\[STREAM_SESSION\]\s*(START|RESUME)/i
 ];
 const END_REGEX_LIST = [
   /Connection terminated/i,
-  /stage .* failed/i
+  /stage .* failed/i,
+  /\[STREAM_SESSION\]\s*(STOP_REQUEST|FAILED|TERMINATED)/i
 ];
 const STREAM_ACTIVITY_REGEX_LIST = [
   /\[INTERNAL_STATS\]/i,
@@ -26,10 +31,13 @@ const STREAM_ACTIVITY_REGEX_LIST = [
   /Average end-to-end client latency/i,
   /Average hardware decoder latency/i,
   /Configuring with format/i,
-  /Using codec/i
+  /Using codec/i,
+  /\[STREAM_SESSION\]\s*(HEARTBEAT|CONNECTED|APP_SESSION_READY)/i
 ];
 
 const MERGE_GAP_MS = 10000;
+const MIN_VALID_DURATION_MS = 20000;
+const MIN_VALID_ACTIVITY_COUNT = 6;
 
 function hasAnyRegex(text, regexList) {
   for (const re of regexList) {
@@ -59,14 +67,82 @@ function mergeWindowPair(prev, next) {
 }
 
 function scoreWindow(window, mode) {
-  const startScore = window.hasStartMarker ? 0.3 : 0;
-  const strongScore = window.hasStrongStart ? 0.5 : 0;
-  const endScore = window.hasEndMarker ? 0.2 : 0;
-  const score = Math.min(1, startScore + strongScore + endScore);
+  const durationMs = Math.max(0, window.endTs.getTime() - window.startTs.getTime());
+  const startScore = window.hasStartMarker ? 0.2 : 0;
+  const strongScore = window.hasStrongStart ? 0.4 : 0;
+  const activityScore = Math.min(0.3, (window.activityCount || 0) / 20);
+  const endScore = window.hasEndMarker ? 0.1 : 0;
+  const score = Math.min(1, startScore + strongScore + activityScore + endScore);
+  const baseValid = window.hasStartMarker
+    && (window.hasStrongStart || (window.activityCount || 0) >= MIN_VALID_ACTIVITY_COUNT)
+    && durationMs >= MIN_VALID_DURATION_MS;
   const valid = mode === 'strict'
-    ? (window.hasStrongStart && score >= 0.5)
-    : (score >= 0.5);
+    ? (baseValid && window.hasStrongStart)
+    : baseValid;
   return { score, valid };
+}
+
+function isLikelyStreamLine(line, tag, payload) {
+  if (APP_LINE_HINT_REGEX.test(line)) return true;
+  if (tag && APP_TAG_HINT_REGEX.test(tag)) return true;
+  if (STREAM_MARKER_HINT_REGEX.test(payload)) return true;
+  return false;
+}
+
+function clipDate(date, minDate, maxDate) {
+  if (minDate && date < minDate) return minDate;
+  if (maxDate && date > maxDate) return maxDate;
+  return date;
+}
+
+export function buildEffectiveWindows(validWindows, {
+  preBufferSec = 5,
+  postBufferSec = 10,
+  clockSkewToleranceSec = 2,
+  minTs = null,
+  maxTs = null
+} = {}) {
+  if (!validWindows || !validWindows.length) return [];
+  const preMs = Math.max(0, (Number(preBufferSec) || 0) * 1000);
+  const postMs = Math.max(0, (Number(postBufferSec) || 0) * 1000);
+  const skewMs = Math.max(0, (Number(clockSkewToleranceSec) || 0) * 1000);
+
+  const expanded = validWindows.map((w) => {
+    const start = new Date(w.startTs.getTime() - preMs - skewMs);
+    const end = new Date(w.endTs.getTime() + postMs + skewMs);
+    return {
+      startTs: clipDate(start, minTs, maxTs),
+      endTs: clipDate(end, minTs, maxTs),
+      baseWindowId: w.id
+    };
+  }).filter((w) => w.endTs >= w.startTs)
+    .sort((a, b) => a.startTs.getTime() - b.startTs.getTime());
+
+  if (!expanded.length) return [];
+  const merged = [expanded[0]];
+  for (let i = 1; i < expanded.length; i += 1) {
+    const cur = expanded[i];
+    const last = merged[merged.length - 1];
+    if (cur.startTs.getTime() <= last.endTs.getTime()) {
+      if (cur.endTs > last.endTs) last.endTs = cur.endTs;
+      continue;
+    }
+    merged.push(cur);
+  }
+  return merged.map((w, idx) => ({
+    id: idx + 1,
+    startTs: w.startTs,
+    endTs: w.endTs
+  }));
+}
+
+export function isTsInWindows(ts, windows) {
+  if (!ts || !windows || !windows.length) return false;
+  const ms = ts.getTime();
+  for (const w of windows) {
+    if (ms >= w.startTs.getTime() && ms <= w.endTs.getTime()) return true;
+  }
+  return false;
 }
 
 export async function detectStreamingPhases(logcatPath, yearHint = new Date().getFullYear(), {
@@ -85,7 +161,8 @@ export async function detectStreamingPhases(logcatPath, yearHint = new Date().ge
       weakStart: 0,
       end: 0,
       activity: 0
-    }
+    },
+    effectiveWindows: []
   };
 
   if (!fs.existsSync(logcatPath)) {
@@ -100,7 +177,6 @@ export async function detectStreamingPhases(logcatPath, yearHint = new Date().ge
   const input = fs.createReadStream(logcatPath);
   const rl = readline.createInterface({ input, crlfDelay: Infinity });
   for await (const line of rl) {
-    if (!APP_LINE_REGEX.test(line)) continue;
     const ts = parseThreadtimeDate(line, yearHint);
     if (!ts) continue;
 
@@ -108,6 +184,7 @@ export async function detectStreamingPhases(logcatPath, yearHint = new Date().ge
     const tag = detail ? detail[1] : '';
     const message = detail ? detail[2] : line;
     const payload = `${tag} ${message}`;
+    if (!isLikelyStreamLine(line, tag, payload)) continue;
 
     const strongStart = STRONG_START_REGEX.test(payload);
     const midStart = hasAnyRegex(payload, MID_START_REGEX_LIST);
@@ -211,19 +288,28 @@ export async function detectStreamingPhases(logcatPath, yearHint = new Date().ge
 }
 
 export function resolveStreamPhase(ts, detection) {
-  if (!ts) return 'unknown';
+  return resolveStreamPhaseEx(ts, detection).phase;
+}
+
+export function resolveStreamPhaseEx(ts, detection) {
+  if (!ts) return { phase: 'unknown', inSession: false };
   const validWindows = (detection && detection.validWindows) || [];
-  if (validWindows.length === 0) return 'preconnect';
+  const effectiveWindows = (detection && detection.effectiveWindows && detection.effectiveWindows.length)
+    ? detection.effectiveWindows
+    : validWindows;
+  if (validWindows.length === 0) return { phase: 'preconnect', inSession: false };
 
   const ms = ts.getTime();
   for (const w of validWindows) {
-    if (ms >= w.startTs.getTime() && ms <= w.endTs.getTime()) return 'stream';
+    if (ms >= w.startTs.getTime() && ms <= w.endTs.getTime()) {
+      return { phase: 'stream', inSession: isTsInWindows(ts, effectiveWindows) };
+    }
   }
   const first = validWindows[0];
   const last = validWindows[validWindows.length - 1];
-  if (ms < first.startTs.getTime()) return 'preconnect';
-  if (ms > last.endTs.getTime()) return 'post';
-  return 'unknown';
+  if (ms < first.startTs.getTime()) return { phase: 'preconnect', inSession: isTsInWindows(ts, effectiveWindows) };
+  if (ms > last.endTs.getTime()) return { phase: 'post', inSession: isTsInWindows(ts, effectiveWindows) };
+  return { phase: 'unknown', inSession: isTsInWindows(ts, effectiveWindows) };
 }
 
 export function getPhaseConfidence(phase, detection) {
@@ -254,4 +340,13 @@ export function buildStreamWindowRows(detection) {
     });
   }
   return rows;
+}
+
+export function buildEffectiveWindowRows(effectiveWindows = []) {
+  return effectiveWindows.map((w) => ({
+    id: w.id,
+    start_ts: w.startTs.toISOString(),
+    end_ts: w.endTs.toISOString(),
+    duration_ms: Math.max(0, w.endTs.getTime() - w.startTs.getTime())
+  }));
 }

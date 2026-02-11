@@ -41,12 +41,16 @@ export function buildReportFiles(logDir) {
     pingHost: path.join(logDir, 'ping_host.log'),
     captureMeta: path.join(logDir, 'capture_meta.json'),
     timelineCsv: path.join(logDir, 'timeline.csv'),
+    timelineSessionCsv: path.join(logDir, 'timeline_session.csv'),
     intervalsCsv: path.join(logDir, 'intervals.csv'),
+    intervalsSessionCsv: path.join(logDir, 'intervals_session.csv'),
     appFocusLog: path.join(logDir, 'app_focus.log'),
     appMetricsCsv: path.join(logDir, 'app_metrics.csv'),
     internalStatsCsv: path.join(logDir, 'internal_stats.csv'),
     streamWindowsCsv: path.join(logDir, 'stream_windows.csv'),
+    streamWindowsEffectiveCsv: path.join(logDir, 'stream_windows_effective.csv'),
     pingLatencyCsv: path.join(logDir, 'ping_latency.csv'),
+    pingLatencySessionCsv: path.join(logDir, 'ping_latency_session.csv'),
     reportMd: path.join(logDir, 'report.md'),
     analysisMeta: path.join(logDir, 'analysis_meta.json')
   };

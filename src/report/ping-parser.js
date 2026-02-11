@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import readline from 'node:readline';
 import { median } from '../shared/stats.js';
+import { resolveStreamPhaseEx } from './stream-phase-detector.js';
 
 const BRACKET_TS_REGEX = /^\[(\d+(?:\.\d+)?)\]\s+/;
 const SUCCESS_REGEX = /icmp_seq=(\d+).*?\btime[=<]?\s*(\d+(?:\.\d+)?)\s*ms/i;
@@ -109,7 +110,8 @@ function buildHighLatencyBursts(highSamples, maxGapMs = 1200) {
 
 export async function parsePingHostLog(filePath, {
   captureStartTs = null,
-  intervalSec = 0.2
+  intervalSec = 0.2,
+  streamDetection = null
 } = {}) {
   const result = {
     exists: fs.existsSync(filePath),
@@ -121,6 +123,7 @@ export async function parsePingHostLog(filePath, {
     firstTs: null,
     lastTs: null,
     tsSourceCounts: {},
+    phaseCounts: {},
     summary: {
       transmitted: null,
       received: null,
@@ -131,7 +134,13 @@ export async function parsePingHostLog(filePath, {
     highLatencyThresholdMs: null,
     highLatencyEvents: [],
     highLatencyBursts: [],
-    jitterEvents: []
+    jitterEvents: [],
+    sessionSamples: [],
+    sessionSuccessCount: 0,
+    sessionFailureCount: 0,
+    sessionHighLatencyEvents: [],
+    sessionHighLatencyBursts: [],
+    sessionJitterEvents: []
   };
   if (!result.exists) return result;
 
@@ -172,6 +181,8 @@ export async function parsePingHostLog(filePath, {
     }
 
     incrementCounter(result.tsSourceCounts, tsSource);
+    const phaseInfo = resolveStreamPhaseEx(ts, streamDetection);
+    incrementCounter(result.phaseCounts, phaseInfo.phase || 'unknown');
     if (!result.firstTs || ts < result.firstTs) result.firstTs = ts;
     if (!result.lastTs || ts > result.lastTs) result.lastTs = ts;
 
@@ -182,6 +193,8 @@ export async function parsePingHostLog(filePath, {
       latencyMs: success ? latencyMs : null,
       status: success ? 'reply' : 'no_reply',
       tsSource,
+      phase: phaseInfo.phase,
+      inSession: phaseInfo.inSession,
       line
     });
   }
@@ -201,6 +214,8 @@ export async function parsePingHostLog(filePath, {
       ts: x.ts,
       seq: x.seq,
       latencyMs: x.latencyMs,
+      phase: x.phase,
+      inSession: x.inSession,
       line: x.line
     }));
     result.highLatencyBursts = buildHighLatencyBursts(highSamples);
@@ -216,10 +231,19 @@ export async function parsePingHostLog(filePath, {
         latencyMs: cur.latencyMs,
         prevLatencyMs: prev.latencyMs,
         deltaMs,
+        phase: cur.phase,
+        inSession: cur.inSession,
         line: cur.line
       });
     }
   }
+
+  result.sessionSamples = result.samples.filter((x) => x.inSession);
+  result.sessionSuccessCount = result.sessionSamples.filter((x) => x.success).length;
+  result.sessionFailureCount = result.sessionSamples.filter((x) => !x.success).length;
+  result.sessionHighLatencyEvents = result.highLatencyEvents.filter((x) => x.inSession);
+  result.sessionHighLatencyBursts = result.highLatencyBursts.filter((b) => resolveStreamPhaseEx(b.startTs, streamDetection).inSession);
+  result.sessionJitterEvents = result.jitterEvents.filter((x) => x.inSession);
 
   return result;
 }

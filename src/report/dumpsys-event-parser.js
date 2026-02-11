@@ -90,6 +90,26 @@ function parseJobsState(bodyText) {
   return { topStartedTrue, fgsTrue };
 }
 
+function parseConnState(bodyText) {
+  const defaultIdRaw = (bodyText.match(/Active default network:\s*(\d+)/i) || [])[1];
+  const defaultNetworkId = defaultIdRaw == null ? null : Number(defaultIdRaw);
+  let defaultTransport = null;
+  if (Number.isFinite(defaultNetworkId)) {
+    const re = new RegExp(`NetworkAgentInfo\\{network\\{${defaultNetworkId}\\}[^\\n]*ni\\{([^}]*)\\}`, 'i');
+    const m = bodyText.match(re);
+    const niText = m && m[1] ? m[1].toUpperCase() : '';
+    if (/\bWIFI\b/.test(niText)) defaultTransport = 'WIFI';
+    else if (/\bMOBILE\b|\bCELLULAR\b/.test(niText)) defaultTransport = 'CELLULAR';
+    else if (/\bETHERNET\b/.test(niText)) defaultTransport = 'ETHERNET';
+    else if (/\bVPN\b/.test(niText)) defaultTransport = 'VPN';
+    else if (niText) defaultTransport = 'UNKNOWN';
+  }
+  return {
+    defaultNetworkId: Number.isFinite(defaultNetworkId) ? defaultNetworkId : null,
+    defaultTransport
+  };
+}
+
 export async function addWifiTransitions(wifiFile, store) {
   const snaps = await parseSnapshotFile(wifiFile);
   let prev = null;
@@ -161,6 +181,27 @@ export async function addJobsTransitions(jobsFile, store) {
       const curTrue = cur.topStartedTrue + cur.fgsTrue;
       if (curTrue > prevTrue) {
         store.addEvent('JOB_ACTIVE_SPIKE', ts, 'dumpsys_jobs', `[dumpsys jobs active +${curTrue - prevTrue}]`, 15000);
+      }
+    }
+    prev = cur;
+  }
+}
+
+export async function addConnectivityTransitions(connFile, store) {
+  const snaps = await parseSnapshotFile(connFile);
+  let prev = null;
+  for (const s of snaps) {
+    if (s.status !== 'OK') continue;
+    const ts = parseIsoDateSafe(s.hostTs);
+    if (!ts) continue;
+    const cur = parseConnState(s.bodyLines.join('\n'));
+    if (!cur) continue;
+    if (prev) {
+      if (prev.defaultNetworkId != null && cur.defaultNetworkId != null && prev.defaultNetworkId !== cur.defaultNetworkId) {
+        store.addEvent('CONN_DEFAULT_SWITCH', ts, 'dumpsys_conn', `[dumpsys conn default ${prev.defaultNetworkId}->${cur.defaultNetworkId}]`, 1500);
+      }
+      if (prev.defaultTransport && cur.defaultTransport && prev.defaultTransport !== cur.defaultTransport) {
+        store.addEvent('CONN_DEFAULT_TRANSPORT_CHANGE', ts, 'dumpsys_conn', `[dumpsys conn transport ${prev.defaultTransport}->${cur.defaultTransport}]`, 1500);
       }
     }
     prev = cur;
